@@ -3,6 +3,8 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QLineEdit, QFrame, QFileDialog, QSizePolicy, QSpacerItem)
 from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap, QImage
+import shutil
+import atexit
 
 # This import assumes a file named 'file_resizer_backend.py' exists in the same directory.
 from file_resizer_backend import resize_image, resize_pdf
@@ -22,12 +24,19 @@ class ResizerWorker(QThread):
         """The main function that runs in the new thread."""
         success = False
         output_path = None
+        
+        # 1. Determine the output path in the code file's location (temp file location)
+        temp_dir = os.path.dirname(os.path.abspath(__file__))
+        base_filename = os.path.splitext(os.path.basename(self.file_path))[0]
+        
         try:
             if self.file_type == "image":
-                output_path = os.path.splitext(self.file_path)[0] + "_resized.jpg"
+                # Ensure the output is always .jpg for maximum compression
+                output_path = os.path.join(temp_dir, f"{base_filename}_resized.jpg")
                 success = resize_image(self.file_path, output_path, self.target_kb, self.aspect_ratio)
             elif self.file_type == "pdf":
-                output_path = os.path.splitext(self.file_path)[0] + "_resized.pdf"
+                # Ensure the output is always .pdf
+                output_path = os.path.join(temp_dir, f"{base_filename}_resized.pdf")
                 success = resize_pdf(self.file_path, output_path, self.target_kb)
         except Exception as e:
             print(f"An error occurred during resizing: {e}")
@@ -48,6 +57,9 @@ class FileResizerApp(QWidget):
         
         self.initUI()
         self.showMaximized()
+        
+        # Register cleanup function to run on application exit
+        atexit.register(self.clean_temp_file)
 
     def set_dark_theme(self):
         """Applies a dark theme to the application."""
@@ -264,8 +276,15 @@ class FileResizerApp(QWidget):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select File", "", filter_text)
         
         if file_path:
+            # 2. Always clean up any previous resized file when a new file is selected
+            self.clean_temp_file()
+            
             self.current_file_path = file_path
-            self.file_name_label.setText(os.path.basename(file_path))
+            
+            # Get original file size for display
+            original_size_kb = os.path.getsize(file_path) / 1024
+            self.file_name_label.setText(f"{os.path.basename(file_path)} ({original_size_kb:.2f} KB)")
+            self.resized_info_label.setText("") # Clear previous results
 
             # Show a preview of the original image in the upload section
             if self.current_file_type == "image":
@@ -292,6 +311,9 @@ class FileResizerApp(QWidget):
         self.resize_btn.setEnabled(False)
         self.download_btn.setEnabled(False)
         self.resized_info_label.setText("")
+        
+        # Clean up any previous resized file before starting a new one
+        self.clean_temp_file()
 
         try:
             target_kb = int(self.target_input.text())
@@ -324,29 +346,54 @@ class FileResizerApp(QWidget):
             self.resized_file_path = output
             file_name = os.path.basename(output)
             file_size_kb = os.path.getsize(output) / 1024
-            self.resized_info_label.setText(f"{file_name} ({file_size_kb:.2f} KB)")
-            self.status_label.setText("File resized successfully!")
+            self.resized_info_label.setText(f"SUCCESS: {file_name} ({file_size_kb:.2f} KB)")
+            self.status_label.setText("File resized successfully! Ready to download.")
         else:
             self.status_label.setText(f"Resizing failed: {output}")
+            # If resizing fails, the path is invalid, so clear it.
+            self.resized_file_path = None
 
     def download_file(self):
-        """Placeholder for file download logic."""
-        if not self.resized_file_path:
+        """
+        Opens a save file dialog to let the user save the resized file,
+        then deletes the temporary file afterward.
+        """
+        if not self.resized_file_path or not os.path.exists(self.resized_file_path):
             self.status_label.setText("Please resize a file first!")
             return
         
         file_name = os.path.basename(self.resized_file_path)
-        save_path, _ = QFileDialog.getSaveFileName(self, "Save Resized File", file_name, "JPEG Files (*.jpeg)")
+        
+        # Determine the file filter and default extension
+        extension = os.path.splitext(file_name)[1]
+        if extension.lower() in ['.jpg', '.jpeg']:
+            filter_text = "JPEG Files (*.jpg *.jpeg)"
+        else:
+            filter_text = "PDF Files (*.pdf)"
+        
+        # Open the save file dialog
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save Resized File", file_name, filter_text)
+        
         if save_path:
             try:
-                os.rename(self.resized_file_path, save_path)
+                # Copy the temporary file to the user-selected location
+                shutil.copy(self.resized_file_path, save_path)
                 self.status_label.setText(f"File saved to: {save_path}")
-                self.resized_file_path = None
+                
+                # 3. Delete the temporary file after successful copy/download
+                self.clean_temp_file()
+                self.download_btn.setEnabled(False)
+                self.resized_info_label.setText(f"Download complete. Temporary file deleted.")
             except Exception as e:
                 self.status_label.setText(f"Error saving file: {e}")
+        else:
+            self.status_label.setText("File download canceled. Temp file remains.")
 
     def reset_ui(self):
-        """Resets the UI to its initial state."""
+        """Resets the UI to its initial state and cleans up temp files."""
+        # Clean up any temporary file
+        self.clean_temp_file()
+        
         self.current_file_path = None
         self.resized_file_path = None
         self.on_file_type_selected("image")
@@ -360,6 +407,18 @@ class FileResizerApp(QWidget):
         self.resized_info_label.setText("")
         self.status_label.setText("")
         self.drag_drop_text.show()
+        
+    def clean_temp_file(self):
+        """Deletes the temporary resized file if it exists."""
+        if self.resized_file_path and os.path.exists(self.resized_file_path):
+            try:
+                os.remove(self.resized_file_path)
+                print(f"Temporary file deleted: {self.resized_file_path}")
+            except Exception as e:
+                # Log error, but continue app execution
+                print(f"Error deleting temporary file: {e}")
+        # Crucially, clear the path reference after attempting deletion
+        self.resized_file_path = None
         
 if __name__ == "__main__":
     app = QApplication(sys.argv)
