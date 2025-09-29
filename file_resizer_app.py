@@ -1,10 +1,11 @@
 import sys, os
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QLineEdit, QFrame, QFileDialog, QSizePolicy, QSpacerItem)
-from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QPixmap, QImage
+from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QUrl
+from PyQt6.QtGui import QFont, QPixmap, QImage, QDragEnterEvent, QDragLeaveEvent, QDropEvent, QFontMetrics
 import shutil
 import atexit
+import fitz # Import the PyMuPDF library to handle PDF previews
 
 # This import assumes a file named 'file_resizer_backend.py' exists in the same directory.
 from file_resizer_backend import resize_image, resize_pdf
@@ -136,8 +137,16 @@ class FileResizerApp(QWidget):
         upload_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.upload_frame.setFixedSize(QSize(450, 500))
         
+        # --- DRAG-AND-DROP CHANGES START HERE ---
+        self.upload_frame.setAcceptDrops(True)
+        # We override the methods from QFrame to add our logic
+        self.upload_frame.dragEnterEvent = self.dragEnterEvent
+        self.upload_frame.dragLeaveEvent = self.dragLeaveEvent
+        self.upload_frame.dropEvent = self.dropEvent
+        # --- DRAG-AND-DROP CHANGES END HERE ---
+        
         # Drag and drop section
-        self.drag_drop_text = QLabel("Drag and drop image or PDF here")
+        self.drag_drop_text = QLabel("Drag and drop image here")
         self.drag_drop_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         self.upload_preview_label = QLabel()
@@ -148,8 +157,8 @@ class FileResizerApp(QWidget):
 
         self.file_name_label = QLabel("No file selected")
         self.file_name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.file_name_label.setWordWrap(True)
-        
+        self.file_name_label.setWordWrap(False) # Keep this as False
+
         browse_button = QPushButton("Browse Files")
         browse_button.clicked.connect(self.open_file_dialog)
         
@@ -242,6 +251,109 @@ class FileResizerApp(QWidget):
         self.pdf_btn.clicked.connect(lambda: self.on_file_type_selected("pdf"))
         self.on_file_type_selected("image")
 
+    # --- DRAG-AND-DROP EVENT HANDLERS ---
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        """
+        Handles the drag-enter event.
+        Changes the border color to provide visual feedback.
+        """
+        if event.mimeData().hasUrls():
+            self.upload_frame.setStyleSheet("QFrame { border: 2px solid #7289da; }")
+            self.status_label.setText("Drop file here")
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent):
+        """
+        Handles the drag-leave event.
+        Resets the border color and status text.
+        """
+        self.upload_frame.setStyleSheet("QFrame { border: 2px solid #4f545c; }")
+        self.status_label.setText("")
+        event.accept()
+
+    def dropEvent(self, event: QDropEvent):
+        """
+        Handles the drop event.
+        Processes the dropped file and resets the UI state.
+        """
+        self.upload_frame.setStyleSheet("QFrame { border: 2px solid #4f545c; }")
+        self.status_label.setText("")
+        
+        urls = event.mimeData().urls()
+        if urls and len(urls) > 0:
+            file_path = urls[0].toLocalFile()
+            self.handle_file_selected(file_path)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+            
+    def handle_file_selected(self, file_path):
+        """
+        A helper method to process a newly selected file from either
+        the browse button or a drag-and-drop action.
+        """
+        self.clean_temp_file()
+        self.current_file_path = file_path
+        
+        original_size_kb = os.path.getsize(file_path) / 1024
+        file_name = os.path.basename(file_path)
+        
+        # Create a full string including the size
+        full_text = f"{file_name} ({original_size_kb:.2f} KB)"
+        
+        # Get font metrics for the label
+        metrics = QFontMetrics(self.file_name_label.font())
+        
+        # Get the maximum width of the label
+        max_width = self.file_name_label.width()
+        
+        # Elide the text from the middle if it's too long
+        elided_text = metrics.elidedText(full_text, Qt.TextElideMode.ElideMiddle, max_width)
+
+        self.file_name_label.setText(elided_text)
+        self.resized_info_label.setText("") # Clear previous results
+
+        # Show a preview of the original file
+        if self.current_file_type == "image":
+            pixmap = QPixmap(file_path)
+            scaled_pixmap = pixmap.scaled(self.upload_preview_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            self.upload_preview_label.setPixmap(scaled_pixmap)
+            self.upload_preview_label.show()
+            self.drag_drop_text.hide()
+        elif self.current_file_type == "pdf":
+            try:
+                # Open the PDF file and get the first page
+                doc = fitz.open(file_path)
+                page = doc.load_page(0)
+                
+                # Render the page to a pixmap
+                pix = page.get_pixmap()
+                
+                # Convert the PyMuPDF pixmap to a PyQt6 QImage
+                qt_image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+                
+                # Convert the QImage to a QPixmap for the label
+                pixmap = QPixmap.fromImage(qt_image)
+                
+                scaled_pixmap = pixmap.scaled(self.upload_preview_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                self.upload_preview_label.setPixmap(scaled_pixmap)
+                self.upload_preview_label.show()
+                self.drag_drop_text.hide()
+                
+                doc.close()
+            except Exception as e:
+                # Handle cases where the PDF can't be rendered
+                print(f"Error rendering PDF preview: {e}")
+                self.status_label.setText("Error: Could not render PDF preview.")
+                self.upload_preview_label.hide()
+                self.drag_drop_text.show()
+        else:
+            self.upload_preview_label.hide()
+            self.drag_drop_text.show()
+        
+        self.status_label.setText("")
 
     def on_file_type_selected(self, file_type):
         """Updates the UI based on the selected file type (image/pdf)."""
@@ -254,6 +366,7 @@ class FileResizerApp(QWidget):
             self.aspect_ratio_widget.setHidden(False)
             self.upload_preview_label.hide()
             self.drag_drop_text.show()
+            self.drag_drop_text.setText("Drag and drop image here")
         else:
             self.image_btn.setObjectName("unselected_btn")
             self.pdf_btn.setObjectName("selected_btn")
@@ -261,6 +374,7 @@ class FileResizerApp(QWidget):
             self.aspect_ratio_widget.setHidden(True)
             self.upload_preview_label.hide()
             self.drag_drop_text.show()
+            self.drag_drop_text.setText("Drag and drop PDF here")
             
         self.image_btn.setStyleSheet(self.styleSheet())
         self.pdf_btn.setStyleSheet(self.styleSheet())
@@ -276,30 +390,7 @@ class FileResizerApp(QWidget):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select File", "", filter_text)
         
         if file_path:
-            # 2. Always clean up any previous resized file when a new file is selected
-            self.clean_temp_file()
-            
-            self.current_file_path = file_path
-            
-            # Get original file size for display
-            original_size_kb = os.path.getsize(file_path) / 1024
-            self.file_name_label.setText(f"{os.path.basename(file_path)} ({original_size_kb:.2f} KB)")
-            self.resized_info_label.setText("") # Clear previous results
-
-            # Show a preview of the original image in the upload section
-            if self.current_file_type == "image":
-                pixmap = QPixmap(file_path)
-                
-                # Scale the pixmap to fit the frame while maintaining aspect ratio
-                scaled_pixmap = pixmap.scaled(self.upload_preview_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                self.upload_preview_label.setPixmap(scaled_pixmap)
-                self.upload_preview_label.show()
-                self.drag_drop_text.hide()
-            else:
-                self.upload_preview_label.hide()
-                self.drag_drop_text.show()
-            
-            self.status_label.setText("")
+            self.handle_file_selected(file_path)
             
     def resize_file(self):
         """Starts the resizing process in a separate thread."""
@@ -396,6 +487,10 @@ class FileResizerApp(QWidget):
         
         self.current_file_path = None
         self.resized_file_path = None
+        
+        # Reset the border style explicitly
+        self.upload_frame.setStyleSheet("QFrame { border: 2px solid #4f545c; }")
+        
         self.on_file_type_selected("image")
         self.target_input.setText("100")
         self.aspect_w.setText("")
